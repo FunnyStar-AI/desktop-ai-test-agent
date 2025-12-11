@@ -1,9 +1,0 @@
-OPENAI_API_KEY=sk-kv78ej8whiRa9GqQZMvn2qJeaJFYWyaFR6mG0V77zPs7QGVR
-OPENAI_BASE_URL=https://api.openai-proxy.org/v1
-MODEL_NAME=gpt-5.1
-
-DATABASE_URL=postgresql://postgres:PMnbbJDZZKNywpFk@115.190.47.220:38888/postgres
-
-UI_TARS_BASE_URL=https://ark.cn-beijing.volces.com/api/v3/
-UI_TARS_API_KEY=dd4d8525-2aec-4159-b693-e7451131a793
-UI_TARS_MODEL=doubao-1-5-ui-tars-250428
