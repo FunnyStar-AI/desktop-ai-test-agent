@@ -6,23 +6,20 @@ import sys
 import asyncio
 from typing import TypedDict, Annotated, Literal, List, Dict, Any
 from typing_extensions import Optional
-from action.enhance_task import EnhanceTaskAction
+
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_openai import ChatOpenAI
-from business_knowledge.database import get_db as get_business_db
-from reasoning_knowledge.database import get_db as get_reasoning_db
-from task_storage.database import get_db as get_task_db
+from models import EnhanceQuestion
+from business_knowledge.database import get_db
 from business_knowledge.crud import BusinessKnowledgeCRUD
 import config
 from action.decompose_task import DecomposeTaskAction
 from action.ui_tars import UITars
-from task_storage.database import get_db as get_task_db
-from task_storage.crud import TaskStorageCRUD
-import json
-from action.judgment_task import JudgmentTask
-from reasoning_knowledge.crud import ReasoningKnowledgeCRUD
+
+# 导入飞书增强器
+from feishu_enhancer import get_feishu_enhancer
 
 # 配置（从全局配置字典获取）
 OPENAI_API_KEY = config.config_dict.get("OPENAI_API_KEY", "")
@@ -73,21 +70,34 @@ class AgentState(TypedDict):
 async def enhance_task_node(state: AgentState) -> AgentState:
     """
     节点1: 补全执行任务
-    使用 LLM 补全和优化任务描述
+    
+    使用联网飞书搜索 + PostgreSQL 向量缓存增强任务描述
+    
+    流程：
+    1. 在 PostgreSQL ai_business_knowledge 表中搜索相似问题
+    2. 若相似度 >= 阈值（默认 0.85），直接返回缓存的 answer_text
+    3. 若未命中缓存，调用 Bocha API 进行联网搜索
+    4. 使用 LLM 整合搜索结果，生成增强后的任务描述
+    5. 将结果存入 PostgreSQL 向量库（question_text=原任务, answer_text=增强结果）
     """
     print(f"[补全任务节点] 原始任务: {state['original_task']}")
-    db = next(get_business_db())
-    crud = BusinessKnowledgeCRUD(db)
-    # 根据问题搜索
-    results = crud.search_by_question(
-        query_text=state['original_task'],
-        top_k=5,
-        threshold=0.5
-    )
-    background_knowledge = "\n".join([result['answer_text'] for result in results])
 
-    action = EnhanceTaskAction(llm)
-    enhanced_task = await action.run(background_knowledge=background_knowledge, original_task=state['original_task'])
+    # 获取飞书增强器实例
+    enhancer = get_feishu_enhancer(llm)
+    
+    # 执行任务增强
+    result = await enhancer.enhance(state['original_task'])
+    
+    enhanced_task = result.get("enhanced_task", state['original_task'])
+    cache_hit = result.get("cache_hit", False)
+    source = result.get("source", "unknown")
+    
+    # 日志输出
+    if cache_hit:
+        similarity = result.get("cache_similarity", 0)
+        print(f"[补全任务节点] 缓存命中 (相似度: {similarity:.4f})")
+    else:
+        print(f"[补全任务节点] 来源: {source}")
     
     print(f"[补全任务节点] 补全后任务: {enhanced_task}")
 
@@ -104,27 +114,37 @@ async def check_executability_node(state: AgentState) -> AgentState:
     使用 LLM 判断任务是否可执行
     """
     print(f"[判断可执行性节点] 检查任务: {state['enhanced_task']}")
-
-    db = next(get_task_db())
-    crud = TaskStorageCRUD(db)
-    results = crud.search_by_enhanced_task(
-        query_text=state['enhanced_task'],
-        top_k=3,
-        threshold=0.8
-    )
-    if results:
-        history_tasks = "\n".join([result['enhanced_task']  + ": 可以执行" if result['all_success'] else result['enhanced_task']  + ": 不能执行" + result['execution_reason']  for result in results])
-    else:
-        history_tasks = ""
     
-    action = JudgmentTask(llm)
-    can_execute, execution_reason = await action.run(history_tasks=history_tasks, task=state['enhanced_task'])
+#     system_prompt = """你是一个任务可行性分析助手。你需要判断给定的任务是否可以通过自动化测试框架执行。
+
+# 请分析任务描述，判断：
+# 1. 任务是否清晰明确
+# 2. 任务是否可以通过 GUI 自动化工具执行
+# 3. 任务是否有明确的执行步骤
+
+# 如果任务可以执行，返回 "YES" 和简要说明。
+# 如果任务不能执行，返回 "NO" 和不能执行的原因。"""
+
+#     messages = [
+#         SystemMessage(content=system_prompt),
+#         HumanMessage(content=f"请判断以下任务是否可执行：\n\n{state['enhanced_task']}\n\n请只返回 YES 或 NO，如果是 NO，请说明原因。")
+#     ]
+    
+#     response = await llm.ainvoke(messages)
+#     response_text = response.content.strip().upper()
+    
+    # can_execute = response_text.startswith("YES")
+    # reason = response.content.strip()
+    can_execute = True
+    reason = "任务可以执行"
+    
+    print(f"[判断可执行性节点] 可执行: {can_execute}, 原因: {reason}")
     
     return {
         **state,
         "can_execute": can_execute,
-        "execution_reason": execution_reason,
-        "messages": [AIMessage(content=f"可执行性判断: {'可执行' if can_execute else '不可执行'} - {execution_reason}")]
+        "execution_reason": reason,
+        "messages": [AIMessage(content=f"可执行性判断: {'可执行' if can_execute else '不可执行'} - {reason}")]
     }
 
 
@@ -135,21 +155,9 @@ async def decompose_task_node(state: AgentState) -> AgentState:
     """
     print(f"[拆解任务节点] 拆解任务: {state['enhanced_task']}")
 
-    db = next(get_reasoning_db())
-    crud = ReasoningKnowledgeCRUD(db)
-    results = crud.search_by_task(
-        query_text=state['enhanced_task'],
-        top_k=2,
-        threshold=0.8
-    )
-    if results:
-        history_tasks = "\n\n".join([result['task_text'] + "\n" + result['step_text'] for result in results])
-    else:
-        history_tasks = ""
-
     action = DecomposeTaskAction(llm)
-    steps = await action.run(history_tasks=history_tasks, task=state['enhanced_task'])
-    print(f"[拆解任务节点] 拆解出 {len(steps)} 个步骤: {steps}")
+    steps = await action.run(task=state['enhanced_task'])
+    
     
     return {
         **state,
@@ -163,6 +171,7 @@ async def decompose_task_node(state: AgentState) -> AgentState:
 async def execute_subtask_node(state: AgentState) -> AgentState:
     """
     节点4: 执行子任务
+    调用 MCP 服务器执行每个子任务
     """
     current_step_index = state.get("current_step_index", 0)
     steps = state.get("steps", [])
@@ -176,27 +185,7 @@ async def execute_subtask_node(state: AgentState) -> AgentState:
     print(f"[执行子任务节点] 执行子任务 {current_step_index + 1}/{len(steps)}: {current_step.get('step', '')}")
     
     try:
-        instruction = """
-        你需要执行‘现在需要执行的步骤’中的步骤。
-
-        # 总任务
-        {task}
-
-        # 先前已经执行的步骤
-        {history_steps}
-
-        # 现在需要执行的步骤
-        {need_execute_step}
-
-        # 注意事项
-        可根据实际情况调整‘现在需要执行的步骤’中的步骤，但要保证调整后的步骤所做的事与‘现在需要执行的步骤’一致。
-        """
-
-        task = state.get("enhanced_task", "")
-        history_steps = "\n".join([f"{idx+1}. {step['step_description']}" for idx, step in enumerate(step_results)])
-        need_execute_step = current_step['step']
-
-        result = await tars.run(instruction=instruction.format(task=task, history_steps=history_steps, need_execute_step=need_execute_step))
+        result = await tars.run(description=current_step['step'], instruction=current_step['step'])
         print(f"[执行子任务节点] 执行结果: {result.get('success', False)}")
 
         # 将结果转换为 step_result 格式
@@ -216,6 +205,7 @@ async def execute_subtask_node(state: AgentState) -> AgentState:
         step_result = {
             "step_id": current_step.get("id"),
             "step_description": current_step.get("step"),
+            "result": None,
             "success": False,
             "error": str(e),
         }
@@ -245,11 +235,11 @@ async def finalize_node(state: AgentState) -> AgentState:
     final_result = {
         "original_task": state.get("original_task"),
         "enhanced_task": state.get("enhanced_task"),
-        "total_steps": len(state.get("steps", [])),
-        "completed_steps": len(step_results),
+        "total_subtasks": len(state.get("steps", [])),
+        "completed_subtasks": len(step_results),
         "all_success": all_success,
-        "step_results": step_results,
-        "summary": f"共执行 {len(step_results)} 个步骤，{'全部成功' if all_success else '部分失败'}"
+        "subtask_results": step_results,
+        "summary": f"共执行 {len(step_results)} 个子任务，{'全部成功' if all_success else '部分失败'}"
     }
     
     print(f"[结束节点] 最终结果: {final_result['summary']}")
@@ -330,18 +320,16 @@ def create_workflow_graph() -> StateGraph:
 
 # === 主函数 ===
 
-async def run_task(task: str, task_id: Optional[int] = None) -> Dict[str, Any]:
+async def run_task(task: str) -> Dict[str, Any]:
     """
     执行一个任务
     
     Args:
         task: 任务描述
-        task_id: 任务 ID（如果已存在记录，则更新；否则创建新记录）
         
     Returns:
-        执行结果，包含 task_id
+        执行结果
     """
-
     # 创建执行图
     app = create_workflow_graph()
     
@@ -363,63 +351,13 @@ async def run_task(task: str, task_id: Optional[int] = None) -> Dict[str, Any]:
     print(f"开始执行任务: {task}")
     print(f"{'='*60}\n")
     
-    
     final_state = await app.ainvoke(initial_state)
     
     print(f"\n{'='*60}")
     print(f"任务执行完成")
     print(f"{'='*60}\n")
     
-    # 获取最终结果
-    final_result = final_state.get("final_result", {})
-    
-    # 保存到数据库
-    db = next(get_task_db())
-    crud = TaskStorageCRUD(db)
-    
-    try:
-        # 准备数据
-        steps_str = json.dumps(final_state.get("steps", []), ensure_ascii=False, indent=2) if final_state.get("steps") else None
-        step_results_json = final_state.get("step_results", [])
-        final_result_str = final_result.get("summary", "")
-        
-        if task_id:
-            # 更新现有记录
-            updated_task = crud.update(
-                task_id=task_id,
-                original_task=final_state.get("original_task"),
-                enhanced_task=final_state.get("enhanced_task"),
-                can_execute=final_state.get("can_execute"),
-                execution_reason=final_state.get("execution_reason"),
-                steps=steps_str,
-                step_results=step_results_json,
-                final_result=final_result_str,
-                all_success=final_result.get("all_success", False)
-            )
-            if updated_task:
-                final_result["task_id"] = updated_task.id
-        else:
-            # 创建新记录
-            new_task = crud.create(
-                original_task=final_state.get("original_task"),
-                enhanced_task=final_state.get("enhanced_task"),
-                can_execute=final_state.get("can_execute"),
-                execution_reason=final_state.get("execution_reason"),
-                steps=steps_str,
-                step_results=step_results_json,
-                final_result=final_result_str,
-                all_success=final_result.get("all_success", False)
-            )
-            final_result["task_id"] = new_task.id
-            print(f"[数据库] 任务已保存，ID: {new_task.id}")
-    except Exception as e:
-        print(f"[数据库] 保存任务失败: {str(e)}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        db.close()
-
-    return final_result
+    return final_state.get("final_result", {})
 
 
 async def main():
@@ -440,4 +378,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
