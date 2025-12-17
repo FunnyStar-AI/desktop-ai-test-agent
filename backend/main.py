@@ -23,6 +23,7 @@ from task_storage.crud import TaskStorageCRUD
 import json
 from action.judgment_task import JudgmentTask
 from reasoning_knowledge.crud import ReasoningKnowledgeCRUD
+from feishu_enhancer import get_feishu_enhancer
 
 # 配置（从全局配置字典获取）
 OPENAI_API_KEY = config.config_dict.get("OPENAI_API_KEY", "")
@@ -73,21 +74,35 @@ class AgentState(TypedDict):
 async def enhance_task_node(state: AgentState) -> AgentState:
     """
     节点1: 补全执行任务
-    使用 LLM 补全和优化任务描述
+    使用联网飞书搜索 + PostgreSQL 向量缓存进行任务增强
+    
+    逻辑流:
+    1. 收到任务 -> 在 PG 中搜索相似 question_text
+    2. 命中缓存（相似度 >= 阈值）-> 直接返回对应的 answer_text
+    3. 未命中 -> 调用 Bocha + Agent 联网搜索 -> 生成结果 -> 存入 PG -> 返回结果
     """
     print(f"[补全任务节点] 原始任务: {state['original_task']}")
-    db = next(get_business_db())
-    crud = BusinessKnowledgeCRUD(db)
-    # 根据问题搜索
-    results = crud.search_by_question(
-        query_text=state['original_task'],
-        top_k=5,
-        threshold=0.5
-    )
-    background_knowledge = "\n".join([result['answer_text'] for result in results])
-
-    action = EnhanceTaskAction(llm)
-    enhanced_task = await action.run(background_knowledge=background_knowledge, original_task=state['original_task'])
+    
+    # 获取飞书增强器实例（单例模式，内置缓存搜索和联网搜索逻辑）
+    enhancer = get_feishu_enhancer(llm)
+    
+    # 调用增强器的 enhance 方法
+    # 该方法内部实现了完整的缓存搜索 + 联网搜索 + 自动存储流程
+    result = await enhancer.enhance(task=state['original_task'])
+    
+    enhanced_task = result.get("enhanced_task", state['original_task'])
+    cache_hit = result.get("cache_hit", False)
+    source = result.get("source", "original")
+    
+    # 打印详细日志
+    if cache_hit:
+        print(f"[补全任务节点] ✓ 命中缓存（相似度: {result.get('cache_similarity', 0):.4f}）")
+    elif result.get("search_performed", False):
+        print(f"[补全任务节点] ✓ 联网搜索完成，结果已存入缓存")
+        if result.get("source_urls"):
+            print(f"[补全任务节点] 参考来源: {result.get('source_urls')}")
+    else:
+        print(f"[补全任务节点] ⚠ 使用原始任务（未启用联网搜索或搜索失败）")
     
     print(f"[补全任务节点] 补全后任务: {enhanced_task}")
 
@@ -177,7 +192,7 @@ async def execute_subtask_node(state: AgentState) -> AgentState:
     
     try:
         instruction = """
-        你需要执行‘现在需要执行的步骤’中的步骤。
+        你需要执行'现在需要执行的步骤'中的步骤。
 
         # 总任务
         {task}
@@ -189,7 +204,7 @@ async def execute_subtask_node(state: AgentState) -> AgentState:
         {need_execute_step}
 
         # 注意事项
-        可根据实际情况调整‘现在需要执行的步骤’中的步骤，但要保证调整后的步骤所做的事与‘现在需要执行的步骤’一致。
+        可根据实际情况调整'现在需要执行的步骤'中的步骤，但要保证调整后的步骤所做的事与'现在需要执行的步骤'一致。
         """
 
         task = state.get("enhanced_task", "")
@@ -440,4 +455,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
