@@ -2,12 +2,13 @@
 UI-TARS Desktop Action
 将 UI-TARS 客户端功能直接集成到 Action 中，用于执行桌面自动化任务
 """
-import os
 import json
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Optional, Tuple
+
+from starlette.middleware import P
 from action.action import Action
 from langchain_openai import ChatOpenAI
 
@@ -127,6 +128,39 @@ class UITars(Action):
         
         return None
     
+    def _check_global_cli(self) -> Tuple[bool, Optional[str]]:
+        """检查全局安装的 UI-TARS CLI 是否可用"""
+        if sys.platform == "win32":
+            # Windows: 检查 ui-tars 命令是否可用
+            try:
+                result = subprocess.run(
+                    ["where", "ui-tars"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    cli_path = result.stdout.strip().split('\n')[0]
+                    return True, cli_path
+            except:
+                pass
+        else:
+            # Unix-like: 检查 ui-tars 命令是否可用
+            try:
+                result = subprocess.run(
+                    ["which", "ui-tars"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode == 0:
+                    cli_path = result.stdout.strip()
+                    return True, cli_path
+            except:
+                pass
+        
+        return False, None
+    
     def _execute_command(
         self,
         instruction: str,
@@ -159,9 +193,11 @@ class UITars(Action):
             # 检查全局 CLI 或使用 npx
             global_cli_installed, cli_path = self._check_global_cli()
             if global_cli_installed:
-                if cli_path:
-                    cmd = ["node", cli_path, "start"] if Path(cli_path).suffix.lower() == '.js' else [cli_path, "start"]
+                # 如果 cli_path 存在，根据文件类型决定执行方式
+                if cli_path and Path(cli_path).suffix.lower() == '.js':
+                    cmd = ["node", cli_path, "start"]
                 else:
+                    # 使用命令名称（全局安装的 CLI）
                     cmd = ["cmd", "/c", "ui-tars", "start"] if sys.platform == "win32" else ["ui-tars", "start"]
             else:
                 npx_cmd = self._find_npx_command() or "npx"
@@ -209,6 +245,7 @@ class UITars(Action):
                 shell=shell,
                 cwd=cwd
             )
+            print(result.stderr)
             
             # 返回结果
             return {
@@ -240,10 +277,6 @@ class UITars(Action):
         
         except Exception as e:
             error_msg = str(e)
-            
-            # 检查是否是模块缺失错误
-            if "Cannot find module" in error_msg or "MODULE_NOT_FOUND" in error_msg:
-                error_msg = error_msg
             
             return {
                 "success": False,

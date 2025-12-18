@@ -1,6 +1,7 @@
 """
 AI Agent 自动化测试框架 - LangGraph 执行图
 """
+from math import e
 import os
 import sys
 import asyncio
@@ -23,6 +24,10 @@ from task_storage.crud import TaskStorageCRUD
 import json
 from action.judgment_task import JudgmentTask
 from reasoning_knowledge.crud import ReasoningKnowledgeCRUD
+from util.screenshot_util import ScreenshotUtil
+from action.multimodal_action.analyze_step import AnalyzeStep
+from action.multimodal_action.optimize_step import OptimizeStep
+from action.accumulate_knowledge import AccumulateKnowledgeAction
 
 # 配置（从全局配置字典获取）
 OPENAI_API_KEY = config.config_dict.get("OPENAI_API_KEY", "")
@@ -84,7 +89,7 @@ async def enhance_task_node(state: AgentState) -> AgentState:
         top_k=5,
         threshold=0.5
     )
-    background_knowledge = "\n".join([result['answer_text'] for result in results])
+    background_knowledge = "\n".join(["问题：" + result['question_text'] + " 回答：" + result['answer_text'] for result in results])
 
     action = EnhanceTaskAction(llm)
     enhanced_task = await action.run(background_knowledge=background_knowledge, original_task=state['original_task'])
@@ -147,8 +152,16 @@ async def decompose_task_node(state: AgentState) -> AgentState:
     else:
         history_tasks = ""
 
+    db = next(get_business_db())
+    crud = BusinessKnowledgeCRUD(db)
+    results = crud.search_by_question(
+        query_text=state['enhanced_task'],
+        top_k=5,
+        threshold=0.5
+    )
+    background_knowledge = "\n".join(["问题：" + result['question_text'] + " 回答：" + result['answer_text'] for result in results])
     action = DecomposeTaskAction(llm)
-    steps = await action.run(history_tasks=history_tasks, task=state['enhanced_task'])
+    steps = await action.run(history_tasks=history_tasks, background_knowledge=background_knowledge, task=state['enhanced_task'])
     print(f"[拆解任务节点] 拆解出 {len(steps)} 个步骤: {steps}")
     
     return {
@@ -166,7 +179,10 @@ async def execute_subtask_node(state: AgentState) -> AgentState:
     """
     current_step_index = state.get("current_step_index", 0)
     steps = state.get("steps", [])
-    step_results = state.get("step_results", [])
+    # 创建 step_results 的副本，避免直接修改原始状态
+    step_results = state.get("step_results", [])[:]
+    
+    print(f"[执行子任务节点] 当前状态 - 索引: {current_step_index}, 总步骤数: {len(steps)}, 已完成: {len(step_results)}")
     
     if current_step_index >= len(steps):
         print(f"[执行子任务节点] 所有子任务已完成")
@@ -174,58 +190,264 @@ async def execute_subtask_node(state: AgentState) -> AgentState:
     
     current_step = steps[current_step_index]
     print(f"[执行子任务节点] 执行子任务 {current_step_index + 1}/{len(steps)}: {current_step.get('step', '')}")
-    
+
+    task = state.get("enhanced_task", "")
+    history_steps = "\n".join([f"{idx+1}. {step['step_description']}" for idx, step in enumerate(step_results)])
+    need_execute_step = current_step['step']
+
+    analyze_action = AnalyzeStep(llm)
+    optimize_action = OptimizeStep(llm)
+
     try:
-        instruction = """
-        你需要执行‘现在需要执行的步骤’中的步骤。
+        n = 0
+        first_flag = False
+        second_flag = False
+        is_first_attempt_success = False  # 标记是否第一次就成功
+        while n < 3:
+            try:
+                previous_image_bytes = ScreenshotUtil.capture_full_screen_bytes()
+                
+                instruction = """
+                你需要执行'现在需要执行的步骤'中的步骤。
 
-        # 总任务
-        {task}
+                # 现在需要执行的步骤
+                {need_execute_step}
 
-        # 先前已经执行的步骤
-        {history_steps}
+                # 注意事项
+                可根据实际情况调整'现在需要执行的步骤'，但要保证调整后的步骤所做的事与'现在需要执行的步骤'一致。
+                """
 
-        # 现在需要执行的步骤
-        {need_execute_step}
+                result = await tars.run(instruction=instruction.format(need_execute_step=need_execute_step))
+                first_flag = result.get('success', False)
+                print(f"[执行子任务节点] 执行结果: {first_flag}")
+                if first_flag:
+                    current_image_bytes = ScreenshotUtil.capture_full_screen_bytes()
+                    second_flag, reason = await analyze_action.run(
+                        task=state.get("enhanced_task"),
+                        history_steps=history_steps,
+                        current_step=need_execute_step,
+                        previous_image=previous_image_bytes,
+                        current_image=current_image_bytes
+                    )
+                    if second_flag:
+                        # 如果第一次就成功（n == 0），标记为完美步骤
+                        if n == 0:
+                            is_first_attempt_success = True
+                        break
+                    else:
+                        # 优化步骤
+                        n += 1
+                        print(f"[执行子任务节点] 分析失败，开始优化步骤 (第 {n} 次)")
+                        
+                        if n >= 3:
+                            print(f"[执行子任务节点] 优化次数超过3次，标记为失败并结束")
+                            # 标记当前步骤为失败
+                            step_result = {
+                                "step_id": current_step.get("id"),
+                                "step_description": current_step.get("step"),
+                                "success": False,
+                                "error": "优化步骤超过3次，自动结束",
+                                "analysis": reason if 'reason' in locals() else "分析失败",
+                            }
+                            step_results.append(step_result)
+                            next_index = current_step_index + 1
+                            return {
+                                **state,
+                                "steps": steps,  # 更新优化后的步骤
+                                "current_step_index": next_index,
+                                "step_results": step_results,
+                                "messages": [AIMessage(content=f"子任务 {current_step_index + 1} 优化失败，已标记为失败")]
+                            }
+                        
+                        # 获取剩余步骤（包含当前步骤）
+                        remaining_steps = steps[current_step_index:]
+                        # 明确标注当前步骤，确保优化时包含当前步骤
+                        remaining_steps_text = "\n".join([
+                            f"{idx+1}. {step.get('step', '')}" + (" (当前步骤)" if idx == 0 else "")
+                            for idx, step in enumerate(remaining_steps)
+                        ])
+                        
+                        # 调用优化步骤
+                        try:
+                            optimized_steps = await optimize_action.run(
+                                task=state.get("enhanced_task"),
+                                history_steps=history_steps,
+                                remaining_steps=remaining_steps_text,
+                                current_image=current_image_bytes
+                            )
+                            
+                            if optimized_steps and len(optimized_steps) > 0:
+                                # 只更新当前步骤和后续步骤，不修改之前的步骤
+                                # 创建新的steps列表，保留之前的步骤不变（复制字典避免引用问题）
+                                new_steps = [step.copy() for step in steps[:current_step_index]]  # 保留之前的步骤（0 到 current_step_index-1）
+                                
+                                # 更新当前步骤（current_step_index）
+                                optimized_first_step = optimized_steps[0]
+                                need_execute_step = optimized_first_step.get('step', need_execute_step)
+                                
+                                # 更新当前步骤，保留其他属性（如id）
+                                if current_step_index < len(steps):
+                                    updated_current_step = steps[current_step_index].copy()
+                                    updated_current_step['step'] = need_execute_step
+                                    new_steps.append(updated_current_step)
+                                
+                                # 更新后续步骤（从 current_step_index+1 开始）
+                                # 直接用优化后的步骤替换所有后续步骤，不保留多余的原始步骤
+                                for i, opt_step in enumerate(optimized_steps[1:], start=1):
+                                    target_index = current_step_index + i
+                                    if target_index < len(steps):
+                                        # 更新现有步骤，保留其他属性
+                                        updated_step = steps[target_index].copy()
+                                        updated_step['step'] = opt_step.get('step', steps[target_index].get('step', ''))
+                                        new_steps.append(updated_step)
+                                    else:
+                                        # 如果优化后的步骤数量超过原有步骤，添加新步骤
+                                        new_steps.append({
+                                            'id': str(target_index + 1),
+                                            'step': opt_step.get('step', '')
+                                        })
+                                
+                                # 更新steps列表
+                                steps = new_steps
+                                
+                                updated_end_index = current_step_index + len(optimized_steps) - 1
+                                print(f"[执行子任务节点] 步骤已优化: {need_execute_step}")
+                                print(f"[执行子任务节点] 已更新步骤索引: {current_step_index} 到 {updated_end_index}，之前的 {current_step_index} 个步骤保持不变，后续步骤已完全替换为优化后的步骤")
+                            else:
+                                print(f"[执行子任务节点] 优化步骤返回空结果，使用原步骤")
+                        except Exception as optimize_error:
+                            import traceback
+                            print(f"[执行子任务节点] 优化步骤失败: {str(optimize_error)}")
+                            print(f"[执行子任务节点] 优化错误详情: {traceback.format_exc()}")
+                        
+                        continue
 
-        # 注意事项
-        可根据实际情况调整‘现在需要执行的步骤’中的步骤，但要保证调整后的步骤所做的事与‘现在需要执行的步骤’一致。
-        """
-
-        task = state.get("enhanced_task", "")
-        history_steps = "\n".join([f"{idx+1}. {step['step_description']}" for idx, step in enumerate(step_results)])
-        need_execute_step = current_step['step']
-
-        result = await tars.run(instruction=instruction.format(task=task, history_steps=history_steps, need_execute_step=need_execute_step))
-        print(f"[执行子任务节点] 执行结果: {result.get('success', False)}")
-
-        # 将结果转换为 step_result 格式
-        step_result = {
-            "step_id": current_step.get("id"),
-            "step_description": current_step.get("step"),
-            "success": result.get("success", False) if isinstance(result, dict) else False,
-        }
+                else:
+                    n += 1
+                    continue
+            
+            except Exception as e:
+                import traceback
+                print(f"[执行子任务节点] 执行步骤时发生异常: {str(e)}")
+                print(f"[执行子任务节点] 错误详情: {traceback.format_exc()}")
+                n += 1
+                if n >= 2:
+                    break
+        
+        # 循环结束后，检查 n 是否为 3
+        if n == 3:
+            # 当 n 为 3 时，直接跳到结束节点，并设置 final_result 为 "客户端存在 BUG"
+            print(f"[执行子任务节点] 达到最大尝试次数 3，判定为客户端存在 BUG，直接跳到结束节点")
+            final_result = {
+                "original_task": state.get("original_task"),
+                "enhanced_task": state.get("enhanced_task"),
+                "total_steps": len(steps),
+                "completed_steps": len(step_results),
+                "all_success": False,
+                "step_results": step_results,
+                "summary": "客户端存在 BUG"
+            }
+            # 设置 current_step_index 为 len(steps)，这样 should_continue_subtasks 会返回 "finalize"
+            return {
+                **state,
+                "steps": steps,
+                "current_step_index": len(steps),
+                "step_results": step_results,
+                "final_result": final_result,
+                "messages": [AIMessage(content="达到最大尝试次数，判定为客户端存在 BUG")]
+            }
+  
+        # 循环结束后，处理结果
+        # 检查是否成功执行（first_flag 和 second_flag 都为 True 表示成功）
+        if first_flag and second_flag:
+            # 如果成功，记录成功结果
+            step_result = {
+                "step_id": current_step.get("id"),
+                "step_description": current_step.get("step"),
+                "success": True,
+                "analysis": "执行成功",
+                "first_flag": first_flag,
+                "second_flag": second_flag,
+                "is_first_attempt_success": is_first_attempt_success,  # 是否第一次就成功
+            }
+        else:
+            # 如果失败，记录失败结果
+            step_result = {
+                "step_id": current_step.get("id"),
+                "step_description": current_step.get("step"),
+                "success": False,
+                "error": "执行失败或超过最大尝试次数",
+                "analysis": "执行失败",
+                "first_flag": first_flag,
+                "second_flag": second_flag,
+                "is_first_attempt_success": False,
+            }
         
         step_results.append(step_result)
-        print(f"[执行子任务节点] 子任务 {current_step_index + 1} 执行完成")
-                
+        # 移动到下一个子任务
+        next_index = current_step_index + 1
+        print(f"[执行子任务节点] 子任务 {current_step_index + 1} 执行完成，准备执行下一个子任务（索引: {next_index}）")
+        print(f"[执行子任务节点] 状态更新: current_step_index {current_step_index} -> {next_index}, step_results 长度: {len(step_results)}")
+        
+        return {
+            **state,
+            "steps": steps,  # 更新优化后的步骤
+            "current_step_index": next_index,
+            "step_results": step_results,
+            "messages": [AIMessage(content=f"子任务 {current_step_index + 1} 执行完成")]
+        }
+    
     except Exception as e:
         import traceback
         print(f"[执行子任务节点] 子任务 {current_step_index + 1} 执行失败: {str(e)}")
         print(f"[执行子任务节点] 错误详情: {traceback.format_exc()}")
+        
+        # 初始化变量
+        previous_image_bytes = None
+        current_image_bytes = None
+        analysis_result = None
+        
+        # 如果执行失败，仍然尝试截图和分析
+        try:
+            previous_image_bytes = ScreenshotUtil.capture_full_screen_bytes()
+        except:
+            pass
+        
+        if previous_image_bytes:
+            try:
+                current_image_bytes = ScreenshotUtil.capture_full_screen_bytes()
+                
+                # 尝试分析
+                task = state.get("enhanced_task", "")
+                history_steps = "\n".join([f"{idx+1}. {step['step_description']}" for idx, step in enumerate(step_results)])
+                need_execute_step = current_step['step']
+                
+                try:
+                    analysis_result = await analyze_action.run(
+                        history_steps=history_steps,
+                        current_step=need_execute_step,
+                        previous_image=previous_image_bytes,
+                        current_image=current_image_bytes
+                    )
+                except:
+                    analysis_result = None
+            except:
+                pass
+        
         step_result = {
             "step_id": current_step.get("id"),
             "step_description": current_step.get("step"),
             "success": False,
             "error": str(e),
+            "analysis": analysis_result,
         }
         step_results.append(step_result)
-    
-    # 移动到下一个子任务
-    next_index = current_step_index + 1
+        # 移动到下一个子任务（即使失败也继续）
+        next_index = current_step_index + 1
     
     return {
         **state,
+        "steps": steps,  # 更新优化后的步骤
         "current_step_index": next_index,
         "step_results": step_results,
         "messages": [AIMessage(content=f"子任务 {current_step_index + 1} 执行完成")]
@@ -239,8 +461,74 @@ async def finalize_node(state: AgentState) -> AgentState:
     """
     print(f"[结束节点] 汇总执行结果")
     
+    # 如果 final_result 已经存在（例如在 n == 3 时设置的），则不覆盖
+    if state.get("final_result") is not None:
+        print(f"[结束节点] 最终结果已存在，直接返回: {state.get('final_result', {}).get('summary', '')}")
+        return state
+    
     step_results = state.get("step_results", [])
     all_success = all(r.get("success", False) for r in step_results)
+
+    if all_success:
+        accumulate_knowledge_action = AccumulateKnowledgeAction(llm)
+        task_text = state.get("enhanced_task")
+        step_text = "\n".join([
+            f"{idx+1}. {step.get('step_description', '')}"
+            for idx, step in enumerate(step_results)
+        ])
+        knowledge_list = await accumulate_knowledge_action.run(task=task_text, steps=step_text)
+        print(f"[结束节点] 总结的知识: {knowledge}")
+        for knowledge in knowledge_list:
+            try:
+                db = next(get_reasoning_db())
+                crud = ReasoningKnowledgeCRUD(db)
+                knowledge = crud.create(
+                    task_text=task_text,
+                    step_text=step_text
+                )
+            except Exception as e:
+                print(f"[结束节点] 存入知识库失败: {str(e)}")
+                import traceback
+                traceback.print_exc()
+            finally:
+                db.close()
+
+    # 检查所有步骤是否都是第一次就完美执行（first_flag 和 second_flag 都为 True，且 is_first_attempt_success 为 True）
+    all_perfect = all(
+        r.get("success", False) and 
+        r.get("first_flag", False) and 
+        r.get("second_flag", False) and 
+        r.get("is_first_attempt_success", False)
+        for r in step_results
+    )
+
+
+
+    
+    # 如果所有步骤都完美，将任务和步骤存入知识库
+    if all_perfect and len(step_results) > 0:
+        try:
+            db = next(get_reasoning_db())
+            crud = ReasoningKnowledgeCRUD(db)
+            
+            # 准备任务文本和步骤文本
+            task_text = state.get("enhanced_task")
+            step_text = "\n".join([
+                f"{idx+1}. {step.get('step_description', '')}"
+                for idx, step in enumerate(step_results)
+            ])
+            
+            # 存入知识库
+            knowledge = crud.create(
+                task_text=task_text,
+                step_text=step_text
+            )
+            print(f"[结束节点] 完美步骤已存入知识库，ID: {knowledge.id}")
+            db.close()
+        except Exception as e:
+            print(f"[结束节点] 存入知识库失败: {str(e)}")
+            import traceback
+            traceback.print_exc()
     
     final_result = {
         "original_task": state.get("original_task"),
@@ -248,11 +536,14 @@ async def finalize_node(state: AgentState) -> AgentState:
         "total_steps": len(state.get("steps", [])),
         "completed_steps": len(step_results),
         "all_success": all_success,
+        "all_perfect": all_perfect,  # 是否所有步骤都完美
         "step_results": step_results,
         "summary": f"共执行 {len(step_results)} 个步骤，{'全部成功' if all_success else '部分失败'}"
     }
     
     print(f"[结束节点] 最终结果: {final_result['summary']}")
+    if all_perfect:
+        print(f"[结束节点] 所有步骤都是第一次就完美执行，已存入知识库")
     
     return {
         **state,
@@ -280,6 +571,8 @@ def should_continue_subtasks(state: AgentState) -> Literal["execute_subtask", "f
     """
     current_index = state.get("current_step_index", 0)
     steps = state.get("steps", [])
+    
+    print(f"[条件判断] 当前索引: {current_index}, 总步骤数: {len(steps)}, 判断结果: {'继续执行' if current_index < len(steps) else '结束'}")
     
     if current_index < len(steps):
         return "execute_subtask"
@@ -425,7 +718,7 @@ async def run_task(task: str, task_id: Optional[int] = None) -> Dict[str, Any]:
 async def main():
     """主函数"""
     # 示例任务
-    example_task = "云文档被分享到IM中能正常打开"
+    example_task = "在IM聊天窗口中使用截图下的提取文本功能，提取文本并发送给对方。"
     
     result = await run_task(example_task)
     

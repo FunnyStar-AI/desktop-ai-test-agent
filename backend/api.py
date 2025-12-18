@@ -129,23 +129,21 @@ async def run_task_api(request: TaskRequest):
                 raise HTTPException(status_code=404, detail=f"任务 ID {request.task_id} 不存在")
         finally:
             db.close()
-    
-    # 在后台执行任务（使用 asyncio.create_task）
-    async def execute_task():
-        """后台执行任务"""
-        try:
-            result = await run_task(request.task, request.task_id)
-            print(f"[API] 任务执行完成，ID: {result.get('task_id')}")
-        except Exception as e:
-            print(f"[API] 任务执行失败: {str(e)}")
-            import traceback
-            traceback.print_exc()
-    
-    # 使用 asyncio.create_task 在后台执行
-    asyncio.create_task(execute_task())
-    
-    # 如果是更新任务，返回现有 task_id
-    if request.task_id:
+        
+        # 在后台执行任务（使用 asyncio.create_task）
+        async def execute_task():
+            """后台执行任务"""
+            try:
+                result = await run_task(request.task, request.task_id)
+                print(f"[API] 任务执行完成，ID: {result.get('task_id')}")
+            except Exception as e:
+                print(f"[API] 任务执行失败: {str(e)}")
+                import traceback
+                traceback.print_exc()
+        
+        # 使用 asyncio.create_task 在后台执行
+        asyncio.create_task(execute_task())
+        
         return TaskResponse(
             task_id=request.task_id,
             message="任务已添加到执行队列（更新模式）",
